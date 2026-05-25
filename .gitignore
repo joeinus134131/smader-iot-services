@@ -1,0 +1,25 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Mac OS
+.DS_Store
+
+# MediaPipe AI Model (Mencegah upload file besar ke repo, file ini akan terdownload otomatis oleh script)
+hand_landmarker.task
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
