@@ -9,6 +9,9 @@ import os
 import urllib.request
 import threading
 from dotenv import load_dotenv
+from collections import deque
+from datetime import datetime
+import queue
 
 # ==========================================
 # KONFIGURASI APLIKASI (LOAD DARI .ENV)
@@ -20,12 +23,16 @@ NOMOR_RUANG = os.getenv("NOMOR_RUANG", "102")
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "3"))
 SHOW_UI = os.getenv("SHOW_UI", "True").lower() in ("true", "1", "yes")
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
+MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "5"))  # Maksimal request dalam queue
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "5"))  # Timeout request
 
 print("=== KONFIGURASI ===")
-print(f"URL_SERVER   : {URL_SERVER}")
-print(f"NOMOR_RUANG  : {NOMOR_RUANG}")
-print(f"SHOW_UI      : {SHOW_UI}")
-print(f"CAMERA_INDEX : {CAMERA_INDEX}")
+print(f"URL_SERVER       : {URL_SERVER}")
+print(f"NOMOR_RUANG      : {NOMOR_RUANG}")
+print(f"COOLDOWN_SECONDS : {COOLDOWN_SECONDS}")
+print(f"SHOW_UI          : {SHOW_UI}")
+print(f"CAMERA_INDEX     : {CAMERA_INDEX}")
+print(f"MAX_QUEUE_SIZE   : {MAX_QUEUE_SIZE}")
 print("===================\n")
 
 # ==========================================
@@ -51,48 +58,169 @@ HAND_CONNECTIONS = [
     (0,17)
 ]
 
+# ==========================================
+# FUNGSI DRAWING UI YANG LEBIH BAIK
+# ==========================================
 def draw_landmarks(img, landmarks):
+    """Draw hand landmarks dengan warna yang lebih bagus"""
     h, w, _ = img.shape
+    # Draw connections dengan warna hijau
     for connection in HAND_CONNECTIONS:
         p1 = landmarks[connection[0]]
         p2 = landmarks[connection[1]]
-        cv2.line(img, (int(p1.x * w), int(p1.y * h)), (int(p2.x * w), int(p2.y * h)), (0, 255, 0), 2)
+        cv2.line(img, (int(p1.x * w), int(p1.y * h)), (int(p2.x * w), int(p2.y * h)), 
+                (0, 255, 0), 2)
+    # Draw landmarks dengan warna merah
     for landmark in landmarks:
         cv2.circle(img, (int(landmark.x * w), int(landmark.y * h)), 4, (0, 0, 255), -1)
 
+def draw_ui_panel(img, fingers_count, kode):
+    """Draw panel informasi yang terstruktur"""
+    h, w = img.shape[:2]
+    
+    # ===== PANEL ATAS (Status & Jari) =====
+    cv2.rectangle(img, (0, 0), (w, 60), (20, 20, 20), cv2.FILLED)
+    cv2.rectangle(img, (0, 0), (w, 60), (100, 100, 100), 1)
+    
+    # Status pengiriman
+    status_text = monitor.current_status
+    status_color = (0, 255, 0) if "SUCCESS" in status_text else \
+                   (0, 165, 255) if "SENDING" in status_text else \
+                   (0, 0, 255) if "ERROR" in status_text or "TIMEOUT" in status_text else \
+                   (200, 200, 200)
+    
+    cv2.putText(img, f"Status: {status_text}", (10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+    cv2.putText(img, f"Jari: {fingers_count} | Kode: {kode}", (w - 280, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 100), 2)
+    
+    # ===== PANEL BAWAH (History & Info) =====
+    history_start_y = h - 160
+    cv2.rectangle(img, (0, history_start_y), (w, h), (20, 20, 20), cv2.FILLED)
+    cv2.rectangle(img, (0, history_start_y), (w, h), (100, 100, 100), 1)
+    
+    # Judul History
+    cv2.putText(img, "Recent Activity:", (10, history_start_y + 25), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 255, 150), 1)
+    
+    # Tampilkan history (maksimal 5 item terbaru)
+    y_offset = history_start_y + 50
+    for idx, event in enumerate(list(monitor.history)[-5:]):
+        text = f"[{event['time']}] Kode:{event['kode']} Jari:{event['fingers']} | {event['status']}"
+        event_color = (0, 255, 0) if "SENT" in event['status'] else \
+                     (0, 165, 255) if "QUEUE" in event['status'] else \
+                     (0, 0, 255) if "FAIL" in event['status'] or "ERROR" in event['status'] else \
+                     (200, 200, 200)
+        cv2.putText(img, text, (10, y_offset), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, event_color, 1)
+        y_offset += 22
+    
+    # ===== INFO QUEUE =====
+    queue_size = monitor.send_queue.qsize()
+    queue_color = (0, 255, 0) if queue_size < MAX_QUEUE_SIZE else (0, 0, 255)
+    cv2.putText(img, f"Queue: {queue_size}/{MAX_QUEUE_SIZE}", 
+                (w - 200, history_start_y + 25), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, queue_color, 1)
+
 # ==========================================
-# FUNGSI PENGIRIMAN DATA (BACKGROUND THREAD)
+# SISTEM MONITORING DAN QUEUE
 # ==========================================
-last_sent_time = 0
-last_sent_kode = 0
+class DataMonitor:
+    """Kelas untuk monitoring data dan status pengiriman"""
+    def __init__(self, max_history=10):
+        self.send_queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
+        self.history = deque(maxlen=max_history)
+        self.current_status = "IDLE"
+        self.last_sent_kode = 0
+        self.last_sent_time = 0
+        self.sending = False
+        self.lock = threading.Lock()
+    
+    def add_history(self, kode, fingers, status):
+        """Tambah event ke history"""
+        with self.lock:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self.history.append({
+                'time': timestamp,
+                'kode': kode,
+                'fingers': fingers,
+                'status': status
+            })
+    
+    def update_status(self, status):
+        """Update status monitoring"""
+        with self.lock:
+            self.current_status = status
+    
+    def should_send(self, kode):
+        """Cek apakah boleh mengirim (cooldown + queue check)"""
+        with self.lock:
+            current_time = time.time()
+            if self.send_queue.full():
+                return False  # Queue penuh, jangan kirim
+            if (current_time - self.last_sent_time > COOLDOWN_SECONDS or 
+                kode != self.last_sent_kode):
+                return True
+        return False
+    
+    def mark_sent(self, kode):
+        """Tandai bahwa kode telah dikirim"""
+        with self.lock:
+            self.last_sent_time = time.time()
+            self.last_sent_kode = kode
+
+monitor = DataMonitor(max_history=15)
 
 def send_request_async(kode):
+    """Pengiriman data ke server dengan status monitoring"""
     def _send():
         try:
+            monitor.update_status("SENDING...")
             payload = {
-                "ruang": str(NOMOR_RUANG),
-                "kode": int(kode)
+                "room": str(NOMOR_RUANG),
+                "code": int(kode)
             }
             print(f"[INFO-NET] Mengirim POST ke {URL_SERVER} -> {payload}")
-            # Menggunakan POST sesuai arsitektur (timeout agar tidak gantung)
-            response = requests.post(URL_SERVER, json=payload, timeout=5)
-            print(f"[SUCCESS-NET] Respon Server: {response.status_code}")
+            response = requests.post(URL_SERVER, json=payload, timeout=REQUEST_TIMEOUT)
+            
+            if response.status_code in [200, 201]:
+                print(f"[SUCCESS-NET] Respon Server: {response.status_code}")
+                monitor.update_status("SUCCESS ✓")
+                monitor.add_history(kode, "?", "SENT")
+            else:
+                print(f"[WARNING-NET] Respon tidak normal: {response.status_code}")
+                monitor.update_status(f"ERROR {response.status_code}")
+                monitor.add_history(kode, "?", f"FAILED ({response.status_code})")
+        except requests.exceptions.Timeout:
+            print(f"[ERROR-NET] Timeout pada {URL_SERVER}")
+            monitor.update_status("TIMEOUT ✗")
+            monitor.add_history(kode, "?", "TIMEOUT")
         except requests.exceptions.RequestException as e:
             print(f"[ERROR-NET] Gagal mengirim data: {e}")
+            monitor.update_status("ERROR ✗")
+            monitor.add_history(kode, "?", "ERROR")
+        finally:
+            # Status sukses akan dihapus setelah 3 detik
+            time.sleep(3)
+            if monitor.current_status in ["SUCCESS ✓", "ERROR ✗", "TIMEOUT ✗"]:
+                monitor.update_status("IDLE")
 
-    # Jalankan request di thread terpisah agar kamera tidak freeze
+    # Jalankan request di thread terpisah
     threading.Thread(target=_send, daemon=True).start()
 
-def process_kode_to_server(kode):
-    global last_sent_time, last_sent_kode
-    current_time = time.time()
-    
-    # Mencegah pengiriman berulang-ulang tanpa jeda
-    if current_time - last_sent_time > COOLDOWN_SECONDS or kode != last_sent_kode:
-        last_sent_time = current_time
-        last_sent_kode = kode
-        send_request_async(kode)
-        return True
+def process_kode_to_server(kode, fingers_count):
+    """Proses kode dan kirim jika memenuhi kondisi"""
+    if monitor.should_send(kode):
+        try:
+            monitor.send_queue.put_nowait((kode, fingers_count))
+            monitor.mark_sent(kode)
+            send_request_async(kode)
+            monitor.add_history(kode, fingers_count, "QUEUED")
+            return True
+        except queue.Full:
+            print("[WARNING-NET] Queue penuh, request diabaikan")
+            monitor.add_history(kode, fingers_count, "QUEUE FULL")
+            return False
     return False
 
 # ==========================================
@@ -162,22 +290,17 @@ def main():
                     elif fingers_count == 5: kode = 4
                     
                     if kode > 0:
-                        status_terkirim = process_kode_to_server(kode)
+                        status_terkirim = process_kode_to_server(kode, fingers_count)
                         if status_terkirim and not SHOW_UI:
                             print(f"[EVENT] Jari {fingers_count} terdeteksi. Kode {kode} di-trigger.")
                     
                     # Hanya lakukan proses drawing visual jika UI diaktifkan
                     if SHOW_UI:
                         draw_landmarks(img, hand_landmarks)
-                        if status_terkirim:
-                            cv2.rectangle(img, (0, 0), (img.shape[1], 50), (0, 200, 0), cv2.FILLED)
-                            cv2.putText(img, f"KODE {kode} TERKIRIM!", (20, 35), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
 
             # --- MODE VISUAL / HEADLESS ---
             if SHOW_UI:
-                cv2.putText(img, f"Jari: {fingers_count} | Kode (Kirim): {kode}", (20, 450), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                draw_ui_panel(img, fingers_count, kode)
                 cv2.imshow('SMADER - Deteksi Pasien', img)
                 
                 # Tekan 'ESC' untuk keluar (wajib di mode UI agar OpenCV merender jendela)
