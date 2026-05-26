@@ -13,7 +13,7 @@ from collections import deque
 from datetime import datetime
 import queue
 
-# ==========================================
+# ============ ==============================
 # KONFIGURASI APLIKASI (LOAD DARI .ENV)
 # ==========================================
 load_dotenv()
